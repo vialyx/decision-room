@@ -1,98 +1,152 @@
-# vinext-starter
+# Decision Room
 
-A clean full-stack starter running on
-[vinext](https://github.com/cloudflare/vinext), with optional Cloudflare D1 and
-Drizzle support.
+Decision Room is a working proof of multi-agent orchestration built with the
+[OpenAI Agents SDK for TypeScript](https://openai.github.io/openai-agents-js/).
 
-## Prerequisites
+The repository demonstrates a concrete orchestration pattern: several
+specialized agents analyze the same decision independently and in parallel,
+then a separate chairperson agent evaluates their structured outputs and
+produces one final recommendation.
 
-- Node.js `>=22.13.0`
+The point of the project is not to simulate a group chat. It is to make the
+coordination mechanics visible and easy to inspect in code:
 
-## Quick Start
+- distinct agent roles and instructions;
+- concurrent agent execution;
+- schema-validated, structured outputs;
+- deterministic application-level orchestration;
+- synthesis by a separate agent with a different mandate;
+- a runnable fallback that demonstrates the product without an API key.
+
+## Orchestration flow
+
+```mermaid
+flowchart LR
+    Brief[Decision brief] --> R[Researcher]
+    Brief --> D[Domain expert]
+    Brief --> S[Skeptic]
+    Brief --> A[Risk analyst]
+
+    R --> Council[Structured analyses]
+    D --> Council
+    S --> Council
+    A --> Council
+
+    Council --> Chair[Chairperson agent]
+    Brief --> Chair
+    Chair --> Memo[Decision memo]
+```
+
+The four specialist runs are started together with `Promise.all()`. Each agent
+returns the same Zod-validated analysis shape. Only after all four analyses are
+complete does the chairperson receive the original brief plus the full council
+record.
+
+This design deliberately preserves disagreement. The chairperson is instructed
+to weigh evidence rather than decide by majority vote.
+
+## The agent council
+
+| Agent | Responsibility |
+| --- | --- |
+| Researcher | Separates evidence from assumptions and identifies missing data |
+| Domain expert | Evaluates strategic fit, feasibility, and operating tradeoffs |
+| Skeptic | Builds the strongest credible case against the apparent consensus |
+| Risk analyst | Maps downside exposure, mitigations, and stop conditions |
+| Chairperson | Synthesizes the independent analyses into a conditional recommendation |
+
+## Where the agent code lives
+
+The complete orchestration is implemented in
+[`app/api/decision/route.ts`](app/api/decision/route.ts):
+
+- `SPECIALISTS` defines the roles and mandates.
+- `runLiveCouncil()` creates and runs the four specialist agents.
+- `Promise.all(specialistRuns)` provides parallel fan-out and fan-in.
+- the `Chairperson` agent performs the final synthesis.
+- `POST()` selects the live or demo execution path.
+
+Shared result contracts are defined in
+[`lib/decision-types.ts`](lib/decision-types.ts). The product interface is in
+[`app/page.tsx`](app/page.tsx).
+
+## Live mode and demo mode
+
+When `OPENAI_API_KEY` is available, requests execute the real Agents SDK
+workflow. Without a key, the API uses a deterministic demo council so the
+interface and result contract remain explorable.
+
+Demo mode is a product fallback, not a second orchestration implementation.
+The proof-of-orchestration code is `runLiveCouncil()`.
+
+## Run locally
+
+### Prerequisites
+
+- Node.js 22.13 or newer
+- An OpenAI API key for live agent execution
+
+Install dependencies:
 
 ```bash
-npm install
-npm run dev
-npm run build
+pnpm install
 ```
 
-This starter does not use `wrangler.jsonc`.
+Create `.env.local`:
 
-## Included Shape
+```bash
+OPENAI_API_KEY=your_api_key
 
-- edit site code under `app/`
-- `.openai/hosting.json` declares optional Sites D1 and R2 bindings
-- `vite.config.ts` simulates declared bindings for local development
-- `db/schema.ts` starts intentionally empty
-- `examples/d1/` contains an optional D1 example surface
-- `drizzle.config.ts` supports local migration generation when needed
-
-## Workspace Auth Headers
-
-OpenAI workspace sites can read the current user's email from
-`oai-authenticated-user-email`.
-
-SIWC-authenticated workspace sites may also receive
-`oai-authenticated-user-full-name` when the user's SIWC profile has a non-empty
-`name` claim. The full-name value is percent-encoded UTF-8 and is accompanied by
-`oai-authenticated-user-full-name-encoding: percent-encoded-utf-8`.
-
-Treat the full name as optional and fall back to email when it is absent:
-
-```tsx
-import { headers } from "next/headers";
-
-export default async function Home() {
-  const requestHeaders = await headers();
-  const email = requestHeaders.get("oai-authenticated-user-email");
-  const encodedFullName = requestHeaders.get("oai-authenticated-user-full-name");
-  const fullName =
-    encodedFullName &&
-    requestHeaders.get("oai-authenticated-user-full-name-encoding") ===
-      "percent-encoded-utf-8"
-      ? decodeURIComponent(encodedFullName)
-      : null;
-
-  const displayName = fullName ?? email;
-  // ...
-}
+# Optional model overrides
+OPENAI_SPECIALIST_MODEL=gpt-5.6-terra
+OPENAI_CHAIR_MODEL=gpt-5.6-sol
 ```
 
-## Optional Dispatch-Owned ChatGPT Sign-In
+Start the application:
 
-Import the ready-to-use helpers from `app/chatgpt-auth.ts` when the site needs
-optional or required ChatGPT sign-in:
+```bash
+pnpm dev
+```
 
-- Use `getChatGPTUser()` for optional signed-in UI.
-- Use `requireChatGPTUser(returnTo)` for server-rendered pages that should send
-  anonymous visitors through Sign in with ChatGPT.
-- Use `chatGPTSignInPath(returnTo)` and `chatGPTSignOutPath(returnTo)` for
-  browser links or actions.
-- Pass a same-origin relative `returnTo` path for the destination after sign-in
-  or sign-out. The helper validates and safely encodes it.
-- Mark protected pages with `export const dynamic = "force-dynamic"` because
-  they depend on per-request identity headers.
+Then open [http://localhost:3000](http://localhost:3000).
 
-Dispatch owns `/signin-with-chatgpt`, `/signout-with-chatgpt`, `/callback`, the
-OAuth cookies, and identity header injection. Do not implement app routes for
-those reserved paths. Routes that do not import and call the helper remain
-anonymous-compatible.
+## Validate
 
-SIWC establishes identity only; it does not prove workspace membership. Use the
-Sites hosting platform's access policy controls for workspace-wide restrictions,
-or enforce explicit server-side membership or allowlist checks.
+```bash
+pnpm build
+pnpm test
+```
 
-Use SIWC for account pages, user-specific dashboards, saved records, and write
-actions tied to the current ChatGPT user. Leave public content anonymous.
+The tests verify that the Decision Room renders, the Agents SDK orchestration
+is present, and the keyless demo request completes end to end.
 
-## Useful Commands
+## What this proof demonstrates
 
-- `npm run dev`: start local development
-- `npm run build`: verify the vinext build output
-- `npm test`: build the starter and verify its rendered loading skeleton
-- `npm run db:generate`: generate Drizzle migrations after schema changes
+This repository is intentionally small, but it establishes the foundations for
+larger agent systems:
 
-## Learn More
+1. **Specialization** — each agent has a narrow perspective instead of sharing
+   one general-purpose prompt.
+2. **Parallelism** — independent analysis runs concurrently to reduce overall
+   workflow latency.
+3. **Typed boundaries** — agents communicate through validated structures
+   rather than loosely formatted prose.
+4. **Separation of analysis and judgment** — specialists investigate; the chair
+   makes the final call.
+5. **Inspectability** — the entire orchestration fits in one server route and
+   can be followed from input to output.
 
-- [vinext Documentation](https://github.com/cloudflare/vinext)
-- [Drizzle D1 Guide](https://orm.drizzle.team/docs/get-started/d1-new)
+Natural next experiments include tool-enabled research, an evaluator/revision
+loop, persisted decision sessions, human approval gates, and orchestration
+evals.
+
+## Stack
+
+- [OpenAI Agents SDK](https://openai.github.io/openai-agents-js/)
+- TypeScript and Zod
+- React and vinext
+- Cloudflare Workers-compatible deployment
+
+## Deployed demo
+
+[decision-room-council.vialyx.chatgpt.site](https://decision-room-council.vialyx.chatgpt.site)
