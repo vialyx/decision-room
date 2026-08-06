@@ -39,11 +39,17 @@ test("server-renders the Decision Room workspace", async () => {
 test("ships governed Agents SDK orchestration primitives", async () => {
   const route = await readFile(new URL("app/api/decision/route.ts", templateRoot), "utf8");
   const governance = await readFile(new URL("lib/decision-governance.ts", templateRoot), "utf8");
+  const approvalRoute = await readFile(new URL("app/api/decision/approval/route.ts", templateRoot), "utf8");
+  const actionPlanner = await readFile(new URL("lib/action-planner.ts", templateRoot), "utf8");
+  const sessions = await readFile(new URL("db/decision-sessions.ts", templateRoot), "utf8");
   const packageJson = await readFile(new URL("package.json", templateRoot), "utf8");
 
   assert.match(route, /from "@openai\/agents"/);
-  assert.match(route, /Promise\.all\(SPECIALISTS\.map/);
+  assert.match(route, /Promise\.allSettled\(SPECIALISTS\.map/);
   assert.match(route, /name: "Chairperson"/);
+  assert.match(route, /name: "Decision Quality Evaluator"/);
+  assert.match(route, /bounded-chair-revision/);
+  assert.match(route, /AbortController/);
   assert.match(route, /handoff\(clarificationAgent/);
   assert.match(route, /withTrace\("Decision Room governed workflow"/);
   assert.match(route, /traceIncludeSensitiveData: false/);
@@ -53,6 +59,14 @@ test("ships governed Agents SDK orchestration primitives", async () => {
   assert.match(governance, /inputGuardrails/);
   assert.match(governance, /outputGuardrails/);
   assert.match(governance, /createMemoGuardrail/);
+  assert.match(actionPlanner, /needsApproval: true/);
+  assert.match(actionPlanner, /preApprovalInputGuardrails|inputGuardrails/);
+  assert.match(approvalRoute, /RunState\.fromString/);
+  assert.match(approvalRoute, /state\.approve\(interruption\)/);
+  assert.match(approvalRoute, /state\.reject\(interruption/);
+  assert.match(approvalRoute, /runResult\.state\.toString\(\)/);
+  assert.match(sessions, /pending_approval/);
+  assert.match(sessions, /action_plan_json/);
   assert.match(packageJson, /"@openai\/agents"/);
 });
 
@@ -83,6 +97,9 @@ test("runs the keyless demo council end to end", async () => {
   assert.equal(result.specialists[0].evidenceAssessments.length, 1);
   assert.equal(result.governance.evidenceToolCalls, 1);
   assert.equal(result.governance.traceIncludesSensitiveData, false);
+  assert.equal(result.approval.status, "unavailable");
+  assert.equal(result.evaluation.disagreementPreserved, 5);
+  assert.equal(result.evaluation.revisionPerformed, false);
   assert.ok(result.memo.facts.length >= 2);
   assert.ok(result.memo.assumptions.length >= 1);
   assert.match(result.memo.verdict, /proceed|pilot/i);
@@ -136,4 +153,19 @@ test("routes underspecified briefs to clarification", async () => {
   assert.equal(result.route, "clarification");
   assert.ok(result.missingInformation.length >= 1);
   assert.equal(result.governance.intakeRoute, "clarification");
+});
+
+test("does not fabricate persisted approval when D1 is unavailable", async () => {
+  const worker = await loadWorker();
+  const response = await worker.fetch(
+    new Request("http://localhost/api/decision/approval", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ decisionId: "dec_123456789abc", decision: "request" }),
+    }),
+    { ASSETS: { fetch: async () => new Response("Not found", { status: 404 }) } },
+    { waitUntil() {}, passThroughOnException() {} },
+  );
+
+  assert.equal(response.status, 404);
 });

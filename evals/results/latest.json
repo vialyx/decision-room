@@ -1,0 +1,19 @@
+{
+  "generatedAt": "2026-08-05T20:19:12.871Z",
+  "mode": "keyless deterministic demo",
+  "fixtureCount": 20,
+  "metrics": {
+    "statusAccuracyPct": 100,
+    "routingAccuracyPct": 100,
+    "categoryAccuracyPct": 100,
+    "guardrailRecallPct": 100,
+    "guardrailSpecificityPct": 100,
+    "structuredOutputRatePct": 100,
+    "disagreementPreservationPct": 100,
+    "unsupportedClaimsPerCouncil": 0,
+    "revisionActivationPct": 16.7,
+    "meanLatencyMs": 3.7,
+    "p95LatencyMs": 4.9
+  },
+  "failures": []
+}

@@ -20,6 +20,7 @@ import {
   CouncilHandoffSchema,
   CouncilReadySchema,
   DecisionRequestSchema,
+  EvaluationSchema,
   MemoSchema,
   SpecialistSchema,
   classifyDecision,
@@ -29,6 +30,7 @@ import {
   inspectEvidence,
   inspectEvidenceItem,
 } from "@/lib/decision-governance";
+import { saveDecisionSession } from "@/db/decision-sessions";
 
 export const runtime = "nodejs";
 
@@ -61,6 +63,36 @@ type IntakeHandoffRecord = {
   priority: "required" | "recommended";
 };
 
+type WorkflowTelemetry = {
+  inputTokens: number;
+  outputTokens: number;
+  retries: number;
+  partialFailures: string[];
+};
+
+function recordUsage(telemetry: WorkflowTelemetry, result: { runContext: { usage: { inputTokens: number; outputTokens: number } } }) {
+  telemetry.inputTokens += result.runContext.usage.inputTokens;
+  telemetry.outputTokens += result.runContext.usage.outputTokens;
+}
+
+async function withReliability<T>(operation: (signal: AbortSignal) => Promise<T>, telemetry: WorkflowTelemetry, timeoutMs = 45_000): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(new Error("Agent run timed out.")), timeoutMs);
+    try {
+      return await operation(controller.signal);
+    } catch (error) {
+      lastError = error;
+      if (error instanceof InputGuardrailTripwireTriggered || attempt === 1) throw error;
+      telemetry.retries += 1;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  throw lastError;
+}
+
 function buildBrief(input: DecisionInput) {
   const evidence = input.evidenceItems.length
     ? input.evidenceItems.map((item, index) => `${index + 1}. [${item.sourceType}] ${item.claim}`).join("\n")
@@ -85,12 +117,12 @@ function traceOptions(decisionId: string, input: DecisionInput) {
       riskTolerance: input.riskTolerance,
       optionCount: String(input.options.length),
       evidenceCount: String(input.evidenceItems.length),
-      workflowVersion: "decision-room-v2",
+      workflowVersion: "decision-room-v3",
     },
   };
 }
 
-async function runLiveIntake(input: DecisionInput, decisionId: string) {
+async function runLiveIntake(input: DecisionInput, decisionId: string, telemetry: WorkflowTelemetry) {
   const intakeModel = process.env.OPENAI_INTAKE_MODEL ?? process.env.OPENAI_SPECIALIST_MODEL ?? "gpt-5.6-terra";
   const safety = classifyDecision(input);
   const deterministicGaps = findDeterministicClarifications(input, safety);
@@ -161,10 +193,15 @@ async function runLiveIntake(input: DecisionInput, decisionId: string) {
     inputGuardrails: [createInputGuardrail(safety)],
   });
 
-  const result = await run(intakeAgent, buildBrief(input), {
-    maxTurns: 3,
-    ...traceOptions(decisionId, input),
-  });
+  const result = await withReliability(
+    (signal) => run(intakeAgent, buildBrief(input), {
+      maxTurns: 3,
+      signal,
+      ...traceOptions(decisionId, input),
+    }),
+    telemetry,
+  );
+  recordUsage(telemetry, result);
 
   const completedHandoff = handoffRecord as IntakeHandoffRecord | null;
   if (!result.finalOutput || !completedHandoff) throw new Error("Intake did not complete a handoff.");
@@ -192,10 +229,11 @@ async function runLiveWorkflow(input: DecisionInput, decisionId: string, started
   const chairModel = process.env.OPENAI_CHAIR_MODEL ?? "gpt-5.6-sol";
   const safety = classifyDecision(input);
   const brief = buildBrief(input);
+  const telemetry: WorkflowTelemetry = { inputTokens: 0, outputTokens: 0, retries: 0, partialFailures: [] };
 
   return withTrace("Decision Room governed workflow", async () => {
     const intake = await withCustomSpan(
-      () => runLiveIntake(input, decisionId),
+      () => runLiveIntake(input, decisionId, telemetry),
       { data: { name: "intake-routing" } },
     );
 
@@ -216,14 +254,19 @@ async function runLiveWorkflow(input: DecisionInput, decisionId: string, started
           guardrailsPassed: intake.inputGuardrailsPassed,
           guardrailsTotal: 1,
           durationMs: Date.now() - startedAt,
+          inputTokens: telemetry.inputTokens,
+          outputTokens: telemetry.outputTokens,
+          estimatedCostUsd: null,
+          retries: telemetry.retries,
+          partialFailures: telemetry.partialFailures,
           traceId,
           traceIncludesSensitiveData: false,
         },
       } satisfies ClarificationResult;
     }
 
-    const specialistResults = await withCustomSpan(
-      () => Promise.all(SPECIALISTS.map(async (specialist) => {
+    const settledSpecialists = await withCustomSpan(
+      () => Promise.allSettled(SPECIALISTS.map(async (specialist) => {
         const isResearcher = specialist.role === "Researcher";
         const agent = new Agent({
           name: specialist.role,
@@ -247,9 +290,13 @@ async function runLiveWorkflow(input: DecisionInput, decisionId: string, started
         });
 
         const result = await withCustomSpan(
-          () => run(agent, brief, { maxTurns: 4, ...traceOptions(decisionId, input) }),
+          () => withReliability(
+            (signal) => run(agent, brief, { maxTurns: 4, signal, ...traceOptions(decisionId, input) }),
+            telemetry,
+          ),
           { data: { name: `specialist-${specialist.role.toLowerCase().replaceAll(" ", "-")}` } },
         );
+        recordUsage(telemetry, result);
         if (!result.finalOutput) throw new Error(`${specialist.role} returned no analysis.`);
         return {
           analysis: SpecialistSchema.parse(result.finalOutput),
@@ -259,6 +306,35 @@ async function runLiveWorkflow(input: DecisionInput, decisionId: string, started
       })),
       { data: { name: "specialist-fan-out" } },
     );
+
+    const specialistResults = settledSpecialists.map((settled, index) => {
+      if (settled.status === "fulfilled") return settled.value;
+      const specialist = SPECIALISTS[index];
+      telemetry.partialFailures.push(specialist.role);
+      return {
+        analysis: {
+          role: specialist.role,
+          mandate: specialist.mandate,
+          stance: "Analysis unavailable",
+          keyInsight: "This specialist failed after the bounded retry; the chair must reduce confidence and avoid assuming this perspective agreed.",
+          findings: [
+            "No specialist findings were produced.",
+            "Treat this perspective as missing, not neutral.",
+            "Prefer a reversible recommendation until the analysis can be rerun.",
+          ],
+          risks: ["Missing independent perspective", "False confidence from partial consensus"],
+          recommendation: "Do not make an irreversible commitment without reviewing the missing perspective.",
+          confidence: 0,
+          evidenceAssessments: [],
+        },
+        toolInputGuardrails: 0,
+        toolOutputGuardrails: 0,
+      };
+    });
+
+    if (telemetry.partialFailures.length > 1) {
+      throw new Error("More than one specialist failed; the council cannot produce a decision-grade memo.");
+    }
 
     const specialists = specialistResults.map((result) => result.analysis);
     const evidenceToolCalls = specialistResults.reduce((total, result) => total + result.toolInputGuardrails, 0);
@@ -289,12 +365,66 @@ async function runLiveWorkflow(input: DecisionInput, decisionId: string, started
 
     const synthesisInput = `${brief}\n\nSPECIALIST ANALYSES:\n${JSON.stringify(specialists, null, 2)}`;
     const chairResult = await withCustomSpan(
-      () => run(chair, synthesisInput, { maxTurns: 3, ...traceOptions(decisionId, input) }),
+      () => withReliability(
+        (signal) => run(chair, synthesisInput, { maxTurns: 3, signal, ...traceOptions(decisionId, input) }),
+        telemetry,
+      ),
       { data: { name: "chair-synthesis-and-validation" } },
     );
+    recordUsage(telemetry, chairResult);
     if (!chairResult.finalOutput) throw new Error("The chairperson returned no memo.");
 
-    const outputGuardrailsPassed = chairResult.outputGuardrailResults.length;
+    let finalMemo = MemoSchema.parse(chairResult.finalOutput);
+    const evaluatorModel = process.env.OPENAI_EVALUATOR_MODEL ?? specialistModel;
+    const evaluator = new Agent({
+      name: "Decision Quality Evaluator",
+      model: evaluatorModel,
+      modelSettings: { reasoning: { effort: "medium" }, text: { verbosity: "low" } },
+      instructions: [
+        "Evaluate the chair memo against explicit acceptance criteria, not style preference.",
+        "Score evidence grounding, disagreement preservation, actionability, and reversibility from 1 to 5.",
+        "List unsupported claims. Require revision if any score is below 4 or any material unsupported claim exists.",
+        "Revision instructions must be concrete and limited to the identified defects.",
+      ].join(" "),
+      outputType: EvaluationSchema,
+    });
+    const evaluationResult = await withCustomSpan(
+      () => withReliability(
+        (signal) => run(evaluator, `${brief}\n\nMEMO TO EVALUATE:\n${JSON.stringify(finalMemo, null, 2)}`, {
+          maxTurns: 2,
+          signal,
+          ...traceOptions(decisionId, input),
+        }),
+        telemetry,
+      ),
+      { data: { name: "decision-quality-evaluation" } },
+    );
+    recordUsage(telemetry, evaluationResult);
+    if (!evaluationResult.finalOutput) throw new Error("The evaluator returned no quality assessment.");
+    const evaluationDraft = EvaluationSchema.parse(evaluationResult.finalOutput);
+    let revisionPerformed = false;
+
+    if (evaluationDraft.revisionRequired) {
+      const revisionInput = [
+        synthesisInput,
+        `DRAFT MEMO:\n${JSON.stringify(finalMemo, null, 2)}`,
+        `EVALUATOR INSTRUCTIONS:\n${evaluationDraft.revisionInstructions.join("\n")}`,
+        "Revise once. Preserve correct content and address only the evaluator's defects.",
+      ].join("\n\n");
+      const revisionResult = await withCustomSpan(
+        () => withReliability(
+          (signal) => run(chair, revisionInput, { maxTurns: 3, signal, ...traceOptions(decisionId, input) }),
+          telemetry,
+        ),
+        { data: { name: "bounded-chair-revision" } },
+      );
+      recordUsage(telemetry, revisionResult);
+      if (!revisionResult.finalOutput) throw new Error("The bounded chair revision returned no memo.");
+      finalMemo = MemoSchema.parse(revisionResult.finalOutput);
+      revisionPerformed = true;
+    }
+
+    const outputGuardrailsPassed = chairResult.outputGuardrailResults.length + (revisionPerformed ? 1 : 0);
     const guardrailsPassed = intake.inputGuardrailsPassed + toolGuardrailsPassed + outputGuardrailsPassed;
 
     return {
@@ -302,7 +432,14 @@ async function runLiveWorkflow(input: DecisionInput, decisionId: string, started
       mode: "live",
       generatedAt: new Date().toISOString(),
       specialists,
-      memo: MemoSchema.parse(chairResult.finalOutput),
+      memo: finalMemo,
+      evaluation: { ...evaluationDraft, revisionPerformed },
+      approval: {
+        status: "available",
+        action: "accept_and_create_action_plan",
+        summary: "A human decision owner must approve before an implementation plan is accepted.",
+      },
+      actionPlan: null,
       governance: {
         decisionId,
         intakeRoute: "decision_council",
@@ -314,6 +451,11 @@ async function runLiveWorkflow(input: DecisionInput, decisionId: string, started
         guardrailsPassed,
         guardrailsTotal: guardrailsPassed,
         durationMs: Date.now() - startedAt,
+        inputTokens: telemetry.inputTokens,
+        outputTokens: telemetry.outputTokens,
+        estimatedCostUsd: null,
+        retries: telemetry.retries,
+        partialFailures: telemetry.partialFailures,
         traceId,
         traceIncludesSensitiveData: false,
       },
@@ -327,7 +469,7 @@ async function runLiveWorkflow(input: DecisionInput, decisionId: string, started
       optionCount: input.options.length,
       evidenceCount: input.evidenceItems.length,
       mode: "live",
-      workflowVersion: "decision-room-v2",
+      workflowVersion: "decision-room-v3",
     },
   });
 }
@@ -347,6 +489,11 @@ function makeGovernance(input: DecisionInput, decisionId: string, startedAt: num
     guardrailsPassed: guardrails,
     guardrailsTotal: guardrails,
     durationMs: Date.now() - startedAt,
+    inputTokens: 0,
+    outputTokens: 0,
+    estimatedCostUsd: 0,
+    retries: 0,
+    partialFailures: [],
     traceId: null,
     traceIncludesSensitiveData: false,
   };
@@ -426,6 +573,22 @@ function demoCouncil(input: DecisionInput, decisionId: string, startedAt: number
       nextSteps: ["Write a one-page pilot charter with cohort size, price, metrics, stop conditions, and a 30-day review date.", "Recruit five representative teams willing to make a paid commitment."],
       confidence: 82,
     },
+    evaluation: {
+      evidenceGrounding: evidenceAssessments.length ? 4 : 3,
+      disagreementPreserved: 5,
+      actionability: 5,
+      reversibility: 5,
+      unsupportedClaims: [],
+      revisionRequired: evidenceAssessments.length === 0,
+      revisionInstructions: evidenceAssessments.length === 0 ? ["Make the absence of attached evidence explicit and reduce confidence."] : [],
+      revisionPerformed: evidenceAssessments.length === 0,
+    },
+    approval: {
+      status: "available",
+      action: "accept_and_create_action_plan",
+      summary: "A human decision owner must approve before an implementation plan is accepted.",
+    },
+    actionPlan: null,
     governance: makeGovernance(input, decisionId, startedAt, "decision_council", "The brief is complete enough for independent specialist analysis."),
   };
 }
@@ -472,6 +635,20 @@ export async function POST(request: Request) {
       result = missing.length
         ? demoClarification(input, decisionId, startedAt, missing)
         : demoCouncil(input, decisionId, startedAt);
+    }
+
+    let persisted = false;
+    try {
+      persisted = await saveDecisionSession({ id: decisionId, mode: result.mode, input, result });
+    } catch (persistenceError) {
+      console.error("Decision session persistence failed", persistenceError);
+    }
+    if (result.route === "decision_council" && !persisted) {
+      result.approval = {
+        status: "unavailable",
+        action: "accept_and_create_action_plan",
+        summary: "Configure the D1 binding to persist approval state before accepting this recommendation.",
+      };
     }
 
     return Response.json(result, { headers: { "cache-control": "no-store" } });

@@ -85,6 +85,16 @@ export const CouncilHandoffSchema = z.object({
   readinessSummary: z.string(),
 });
 
+export const EvaluationSchema = z.object({
+  evidenceGrounding: z.number().int().min(1).max(5),
+  disagreementPreserved: z.number().int().min(1).max(5),
+  actionability: z.number().int().min(1).max(5),
+  reversibility: z.number().int().min(1).max(5),
+  unsupportedClaims: z.array(z.string()).max(6),
+  revisionRequired: z.boolean(),
+  revisionInstructions: z.array(z.string()).max(5),
+});
+
 const RELIABILITY: Record<EvidenceSourceType, number> = {
   analytics: 90,
   customer_interview: 78,
@@ -106,17 +116,18 @@ export type SafetyAssessment = {
 
 export function classifyDecision(input: Pick<DecisionInput, "decision" | "context" | "objectives">): SafetyAssessment {
   const text = `${input.decision}\n${input.context}\n${input.objectives}`;
-  const category: DecisionCategory = /hire|fire|layoff|promotion|employee|candidate/i.test(text)
+  const decisionText = input.decision;
+  const category: DecisionCategory = /\b(hire|firing?|terminate (?:a |an |the )?(?:employee|manager)|layoffs?|promotions?|employees?|candidates?|performance plan)\b/i.test(text)
     ? "employment"
     : /diagnos|treatment|patient|medical|clinical/i.test(text)
       ? "medical"
-      : /lawsuit|contract|legal|compliance|regulat/i.test(text)
+      : /\b(lawsuits?|contracts?|legal|compliance|regulations?|liability clause)\b/i.test(text)
         ? "legal"
         : /invest|loan|portfolio|financial|credit/i.test(text)
           ? "financial"
-          : /deploy|architecture|technical|engineering|database/i.test(text)
+        : /deploy|architecture|technical|engineering|database|data warehouse|api gateway|platform|service rewrite|migrat/i.test(decisionText)
             ? "engineering"
-            : /support|vendor|process|operations|capacity/i.test(text)
+            : /support|vendor|process|operations|capacity/i.test(decisionText)
               ? "operations"
               : "product";
 
@@ -175,6 +186,8 @@ export const inspectEvidence = tool({
   description: "Evaluate one supplied evidence item and classify its reliability using deterministic business rules.",
   parameters: EvidenceItemSchema,
   outputSchema: EvidenceAssessmentSchema,
+  timeoutMs: 3_000,
+  timeoutBehavior: "raise_exception",
   inputGuardrails: [{
     name: "evidence_argument_safety",
     run: async ({ toolCall }) => {

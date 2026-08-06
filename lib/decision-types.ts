@@ -72,8 +72,43 @@ export type GovernanceSummary = {
   guardrailsPassed: number;
   guardrailsTotal: number;
   durationMs: number;
+  inputTokens: number;
+  outputTokens: number;
+  estimatedCostUsd: number | null;
+  retries: number;
+  partialFailures: string[];
   traceId: string | null;
   traceIncludesSensitiveData: false;
+};
+
+export type DecisionEvaluation = {
+  evidenceGrounding: number;
+  disagreementPreserved: number;
+  actionability: number;
+  reversibility: number;
+  unsupportedClaims: string[];
+  revisionRequired: boolean;
+  revisionInstructions: string[];
+  revisionPerformed: boolean;
+};
+
+export type DecisionApproval = {
+  status: "available" | "pending" | "approved" | "rejected" | "unavailable";
+  action: "accept_and_create_action_plan";
+  summary: string;
+};
+
+export type ActionPlan = {
+  status: "approved" | "rejected";
+  recommendedOption: string;
+  objective: string;
+  tasks: Array<{
+    title: string;
+    ownerRole: string;
+    dueInDays: number;
+    successMeasure: string;
+  }>;
+  approvedAt: string | null;
 };
 
 export type DecisionResult = {
@@ -82,6 +117,9 @@ export type DecisionResult = {
   generatedAt: string;
   specialists: SpecialistAnalysis[];
   memo: DecisionMemo;
+  evaluation: DecisionEvaluation;
+  approval: DecisionApproval;
+  actionPlan: ActionPlan | null;
   governance: GovernanceSummary;
 };
 

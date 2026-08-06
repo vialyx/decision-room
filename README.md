@@ -1,147 +1,179 @@
 # Decision Room
 
-Decision Room is a governed multi-agent decision system built with the
+Decision Room is an educational proof of multi-agent orchestration built with the
 [OpenAI Agents SDK for TypeScript](https://openai.github.io/openai-agents-js/).
+It shows how a leadership decision can move through semantic intake routing,
+independent specialist analysis, adversarial synthesis, rubric evaluation, one
+bounded revision, and explicit human approval before a consequential action.
 
-It is an educational, inspectable example of how to combine semantic routing,
-typed tools, layered guardrails, deterministic parallel orchestration, and
-trace-based observability without handing decision authority to AI.
-
-The application accepts a decision brief, checks whether it is safe and
-sufficiently specified, routes incomplete briefs to clarification, and sends
-ready briefs to four independent specialists. A separate chairperson preserves
-material disagreement and returns a conditional recommendation.
+The system advises; it does not silently execute. Its orchestration, guardrails,
+approval boundary, persisted state, telemetry, and evaluation results are kept
+visible so the repository can be studied and adapted by the community.
 
 ## Governed workflow
 
 ```mermaid
 flowchart TD
-    Brief[Decision brief + evidence] --> InputGuardrail[Blocking input guardrail]
-    InputGuardrail --> Intake[Intake Agent]
-    Intake -->|SDK handoff: incomplete| Clarification[Clarification Agent]
-    Intake -->|SDK handoff: ready| Coordinator[Decision Council Coordinator]
-
+    Brief[Decision brief + evidence] --> Guard[Blocking input guardrail]
+    Guard --> Intake[Intake Agent]
+    Intake -->|incomplete| Clarify[Clarification Agent]
+    Intake -->|ready| Coordinator[Council Coordinator]
     Coordinator --> R[Researcher]
     Coordinator --> D[Domain expert]
     Coordinator --> S[Skeptic]
     Coordinator --> A[Risk analyst]
-
-    Evidence[Typed evidence items] --> Tool[inspect_evidence tool]
-    Tool -->|tool input + output guardrails| R
-
-    R --> Council[Structured analyses]
-    D --> Council
-    S --> Council
-    A --> Council
-
-    Council --> Chair[Chairperson Agent]
-    Chair --> OutputGuardrail[Semantic output guardrail]
-    OutputGuardrail --> Memo[Conditional decision memo]
+    Evidence[Typed evidence] --> Tool[Guarded evidence tool]
+    Tool --> R
+    R --> Chair[Chairperson]
+    D --> Chair
+    S --> Chair
+    A --> Chair
+    Chair --> MemoGuard[Memo output guardrail]
+    MemoGuard --> Eval[Quality Evaluator]
+    Eval -->|criteria missed| Revision[One bounded revision]
+    Eval -->|accepted| Recommendation[Recommendation]
+    Revision --> Recommendation
+    Recommendation --> Approval{Human approval}
+    Approval -->|reject| Stop[No action]
+    Approval -->|approve| Plan[Accepted action plan]
 ```
 
-Two orchestration patterns are deliberately used for different jobs:
+Two orchestration patterns are used deliberately:
 
-- **Model-selected SDK handoffs** route a brief according to its meaning and
-  completeness. Once selected, the receiving intake specialist takes control.
-- **Deterministic application orchestration** launches every council specialist
-  with `Promise.all()`. Every perspective must run; routing by model choice
-  would make this stage less predictable.
+- Model-selected SDK handoffs route the brief according to meaning and
+  completeness.
+- Deterministic application orchestration runs all four required specialists
+  with `Promise.allSettled()`, permits one explicit partial failure, and stops if
+  more than one specialist is unavailable.
 
-## SDK capabilities demonstrated
+## What the repository demonstrates
 
-| Capability | Portfolio evidence |
+| Capability | Implementation |
 | --- | --- |
-| Agents | Intake, clarification, coordinator, four specialists, and chairperson |
-| Tools | Researcher invokes `inspect_evidence` with a Zod input and output schema |
-| Handoffs | Intake transfers control through typed clarification and council payloads |
-| Guardrails | Blocking input safety, tool input/output checks, and semantic memo validation |
-| Structured output | Specialist, evidence, clarification, readiness, and memo contracts |
-| Tracing | One named workflow trace with custom phase spans and safe metadata |
-| Parallel orchestration | All four mandatory specialist runs fan out and fan in deterministically |
+| Agents | Intake, clarification, coordinator, four specialists, chair, evaluator, and implementation planner |
+| Handoffs | Typed intake transfers to clarification or council coordination |
+| Tools | Researcher evidence inspection plus an approval-required action-plan tool |
+| Guardrails | Blocking input, tool input/output, memo output, and protected-action checks |
+| Structured output | Zod contracts for every agent and API result |
+| Human in the loop | `needsApproval`, serialized `RunState`, approve/reject, and resumed execution |
+| Persistence | D1 decision sessions, evaluations, interrupted state, approvals, and action plans |
+| Reliability | 45-second run deadlines, one retry, partial-failure policy, and telemetry |
+| Evaluation | Rubric grader, at most one chair revision, 20 deterministic fixtures, and CI |
+| Observability | Named traces, safe metadata, duration, token usage, retries, and partial failures |
 
-## Evidence tool
+## Approval and persistence
 
-Users can attach up to six evidence items and label each source as analytics,
-customer interview, survey, estimate, or assumption. The Researcher is the only
-specialist equipped with the `inspect_evidence` function tool.
+The recommendation and the action are separate states. A completed council run
+is persisted before the UI offers an approval action. Requesting approval runs
+the Implementation Planner until its protected tool interrupts. The serialized
+SDK `RunState` is stored in D1. A later approve or reject request reconstructs
+the agent, restores the state with `RunState.fromString()`, resolves every
+interruption, and resumes the run.
 
-The model chooses and invokes the tool; deterministic application logic assigns
-the reliability score and warning. Tool guardrails reject malformed arguments,
-prompt injection, secrets, and personal data, then validate the returned result
-before it re-enters the agent loop.
+No external system is modified. In this educational project, the protected
+action accepts and records a bounded implementation plan. The same pattern can
+be adapted to a task tracker or messaging system only after adding appropriate
+authorization, idempotency, and organization-specific controls.
 
-This boundary demonstrates that models can decide *when* to use a capability
-while application code retains control of *what the capability does*.
+The database schema and generated migration live in:
+
+- [`db/schema.ts`](db/schema.ts)
+- [`db/decision-sessions.ts`](db/decision-sessions.ts)
+- [`drizzle/0000_tense_pandemic.sql`](drizzle/0000_tense_pandemic.sql)
+
+If D1 is unavailable, the recommendation still renders but approval is marked
+unavailable. The system does not pretend that interrupted state was persisted.
+
+## Evaluator and bounded revision
+
+After synthesis, a separate evaluator scores the memo from 1–5 on evidence
+grounding, disagreement preservation, actionability, and reversibility. It also
+lists unsupported claims. A score below 4 or a material unsupported claim can
+trigger exactly one targeted chair revision. There is no open-ended
+self-improvement loop.
+
+The UI exposes the rubric, whether revision was required, and whether it was
+performed.
 
 ## Guardrail boundaries
 
-Decision Room applies controls at three distinct boundaries:
+1. Input: rejects prompt injection, credentials, and common personal-data
+   patterns before model or tool work. High-stakes categories require an
+   identified qualified human reviewer.
+2. Tool: validates evidence arguments and deterministic evidence results.
+3. Output: requires a submitted option, facts/assumptions separation, preserved
+   disagreement, and measurable stop conditions.
+4. Action: validates the implementation-plan scope before approval and validates
+   its result after execution.
 
-1. **Input** — a blocking SDK guardrail runs with `runInParallel: false`, so an
-   unsafe brief cannot start model or tool work. Prompt injection, credentials,
-   and common personal-data patterns are rejected. Employment, medical, legal,
-   and financial decisions require explicit qualified human review.
-2. **Tool** — every evidence-tool call validates arguments before execution and
-   validates the deterministic result afterward.
-3. **Output** — the chairperson memo must name exactly one submitted option,
-   preserve disagreement, separate facts from assumptions, and include at least
-   two measurable stop or reversal conditions.
+These controls are an inspectable example, not a complete organizational safety
+policy.
 
-Zod answers “is this structure valid?” Guardrails answer “is this workflow
-responsible enough to continue?”
+## Reliability and observability
 
-## Tracing and sensitive-data policy
+Every model run has a 45-second application deadline and at most one retry. Tool
+calls have shorter SDK-level timeouts. A single failed specialist is represented
+as a missing perspective with zero confidence; two failures stop synthesis.
 
-Live runs are grouped under one `Decision Room governed workflow` trace. Custom
-spans identify intake routing, specialist fan-out, each specialist, and chair
-synthesis plus semantic validation.
+Live runs are grouped under a named workflow trace. Trace metadata includes only
+operational identifiers and counts; the decision text is excluded and
+`traceIncludeSensitiveData` is `false`. The response inspector reports duration,
+token counts, retries, partial failures, guardrail results, and the trace ID.
+Dollar cost remains `null` for live runs because model prices change and the
+repository does not hard-code a potentially stale rate card.
 
-Trace metadata contains only operational fields:
+## Evaluation suite
 
-- generated decision ID;
-- risk posture;
-- option and evidence counts;
-- execution mode;
-- workflow version.
+`evals/fixtures.json` contains 20 keyless cases covering ready briefs,
+clarification routing, high-stakes review, prompt injection, secrets, personal
+data, structured output, disagreement preservation, and bounded revision. Run:
 
-The full decision text is never copied into trace metadata, and
-`traceIncludeSensitiveData` is set to `false`. The interface exposes the
-decision ID, handoff destination, tool-call count, passed guardrails, and trace
-privacy policy as a lightweight run inspector.
+```bash
+pnpm eval
+```
+
+The runner writes the measured result to
+[`evals/results/latest.json`](evals/results/latest.json) and fails when routing,
+guardrail recall, output structure, or disagreement preservation regress. These
+are deterministic demo-mode measurements, not claims about live-model quality.
+Live model evaluation requires `OPENAI_API_KEY` and a separate budgeted test run.
+
+GitHub Actions runs lint, tests, and this evaluation suite on pushes and pull
+requests.
 
 ## Where the implementation lives
 
-- [`app/api/decision/route.ts`](app/api/decision/route.ts) defines the agents,
-  typed handoffs, deterministic parallel council, named trace, and API flow.
-- [`lib/decision-governance.ts`](lib/decision-governance.ts) contains schemas,
-  evidence logic, safety classification, and all three guardrail layers.
-- [`lib/decision-types.ts`](lib/decision-types.ts) defines browser/server result
-  contracts.
-- [`app/page.tsx`](app/page.tsx) makes evidence, intake routing, and governance
-  outcomes visible in the product.
+- [`app/api/decision/route.ts`](app/api/decision/route.ts): routing, council,
+  reliability, synthesis, evaluation, revision, tracing, and persistence.
+- [`app/api/decision/approval/route.ts`](app/api/decision/approval/route.ts):
+  approval interruption, serialized state, approve/reject, and resume.
+- [`lib/decision-governance.ts`](lib/decision-governance.ts): schemas, safety
+  classification, evidence tool, and guardrails.
+- [`lib/action-planner.ts`](lib/action-planner.ts): protected action-plan tool.
+- [`lib/decision-types.ts`](lib/decision-types.ts): browser/server contracts.
+- [`app/page.tsx`](app/page.tsx): decision workspace and governance inspector.
 
 ## Live and demo modes
 
-When `OPENAI_API_KEY` is available, the request executes the real Agents SDK
-workflow. Without a key, the API uses a deterministic demo path that preserves
-the same response contract and visibly labels the result as a demo.
+With `OPENAI_API_KEY`, the API executes the real Agents SDK workflow. Without a
+key, it uses a deterministic demo path with the same response contract. Demo
+mode makes the interface, guardrails, evaluator, and eval suite reproducible
+without token spend.
 
-Demo mode allows the interface and governance outcomes to be explored without
-spending tokens. The actual SDK handoff, tool, guardrail, and trace proof is in
-the live workflow code.
+Approval requires a configured D1 binding in either mode. The live
+approval/resume code is build- and source-tested locally; fully exercising it
+also requires a deployed or locally emulated D1 binding and an OpenAI API key.
 
 ## Run locally
 
-Prerequisites:
-
-- Node.js 22.13 or newer
-- An OpenAI API key for live execution
+Prerequisites: Node.js 22.13 or newer and pnpm.
 
 ```bash
 pnpm install
+pnpm dev
 ```
 
-Create `.env.local`:
+For live agents, create `.env.local`:
 
 ```bash
 OPENAI_API_KEY=your_api_key
@@ -150,45 +182,40 @@ OPENAI_API_KEY=your_api_key
 OPENAI_INTAKE_MODEL=gpt-5.6-terra
 OPENAI_SPECIALIST_MODEL=gpt-5.6-terra
 OPENAI_CHAIR_MODEL=gpt-5.6-sol
+OPENAI_EVALUATOR_MODEL=gpt-5.6-terra
+OPENAI_PLANNER_MODEL=gpt-5.6-terra
 ```
 
-Start the application:
-
-```bash
-pnpm dev
-```
-
-Then open [http://localhost:3000](http://localhost:3000).
+Never commit `.env.local` or API keys.
 
 ## Validate
 
 ```bash
-pnpm build
+pnpm lint
 pnpm test
+pnpm eval
 ```
 
-The tests verify rendering, SDK primitives, the keyless governed council,
-prompt-injection blocking, and clarification routing.
+Generate a migration after schema changes with `pnpm db:generate`. Migration
+generation is local; applying it requires an explicitly configured D1 target.
 
-## Governance tradeoffs
+## Threat model and limitations
 
-- The intake model may route semantically, but it cannot skip a mandatory
-  specialist once the council begins.
-- Tool scores are deterministic and inspectable rather than generated by the
-  model.
-- The chairperson advises; it does not approve, send, save, or execute the
-  recommendation.
-- Traces favor privacy over full replay by excluding sensitive payload data.
-- Guardrails are intentionally small demonstrations, not a substitute for a
-  complete organization-specific safety policy.
-
-## Next production-control milestone
-
-The next bounded increment is a human-approved “accept and create action plan”
-tool with persisted interrupted run state, followed by one rubric-based
-evaluation and at most one chair revision. Those controls are intentionally not
-simulated in the current release.
+- Input checks use intentionally small pattern-based demonstrations and can
+  produce false positives or miss obfuscated attacks.
+- Structured output and guardrails reduce malformed responses; they do not make
+  model judgment infallible.
+- D1 state needs production retention, access-control, encryption, and deletion
+  policies appropriate to the data entered by an organization.
+- Approval state should be protected with authenticated user identity and
+  authorization before real organizational use.
+- The action tool records a plan only. It has no task-tracker, email, payment,
+  deployment, or other external side effect.
+- The deterministic eval suite validates system behavior in demo mode. It does
+  not replace live-model evals, red teaming, or domain-expert review.
 
 ## Deployed demo
 
-[decision-room-council.vialyx.chatgpt.site](https://decision-room-council.vialyx.chatgpt.site)
+[decision-room-council.vialyx.chatgpt.site](https://decision-room-council.vialyx.chatgpt.site/)
+
+The hosted demo may lag local commits until a deliberate deployment is made.

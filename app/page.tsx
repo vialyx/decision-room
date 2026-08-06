@@ -2,6 +2,7 @@
 
 import { FormEvent, useMemo, useState } from "react";
 import type {
+  ActionPlan,
   DecisionApiResult,
   DecisionInput,
   EvidenceSourceType,
@@ -83,7 +84,11 @@ export default function Home() {
   const [evidenceSource, setEvidenceSource] = useState<EvidenceSourceType>("analytics");
   const [result, setResult] = useState<DecisionApiResult | null>(null);
   const [isRunning, setIsRunning] = useState(false);
+  const [isApproving, setIsApproving] = useState(false);
+  const [approvalStatus, setApprovalStatus] = useState<"idle" | "pending" | "approved" | "rejected">("idle");
+  const [actionPlan, setActionPlan] = useState<ActionPlan | null>(null);
   const [error, setError] = useState("");
+  const [approvalError, setApprovalError] = useState("");
 
   const canRun = useMemo(
     () => brief.decision.trim().length >= 12 && brief.context.trim().length >= 20,
@@ -114,6 +119,9 @@ export default function Home() {
 
     setIsRunning(true);
     setError("");
+    setApprovalError("");
+    setApprovalStatus("idle");
+    setActionPlan(null);
     setResult(null);
 
     try {
@@ -131,6 +139,27 @@ export default function Home() {
       setError(caught instanceof Error ? caught.message : "Something interrupted the session.");
     } finally {
       setIsRunning(false);
+    }
+  }
+
+  async function resolveApproval(decision: "request" | "approve" | "reject") {
+    if (!decisionResult) return;
+    setIsApproving(true);
+    setApprovalError("");
+    try {
+      const response = await fetch("/api/decision/approval", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ decisionId: decisionResult.governance.decisionId, decision }),
+      });
+      const payload = await response.json() as { status?: "pending" | "approved" | "rejected"; actionPlan?: ActionPlan; error?: string };
+      if (!response.ok) throw new Error(payload.error ?? "The approval workflow could not continue.");
+      if (payload.status) setApprovalStatus(payload.status);
+      if (payload.actionPlan) setActionPlan(payload.actionPlan);
+    } catch (caught) {
+      setApprovalError(caught instanceof Error ? caught.message : "The approval workflow could not continue.");
+    } finally {
+      setIsApproving(false);
     }
   }
 
@@ -332,6 +361,8 @@ export default function Home() {
               <div><span>SDK handoff</span><strong>{result.governance.handoffDestination}</strong></div>
               <div><span>Evidence tools</span><strong>{result.governance.evidenceToolCalls}</strong></div>
               <div><span>Guardrails</span><strong>{result.governance.guardrailsPassed}/{result.governance.guardrailsTotal} passed</strong></div>
+              <div><span>Tokens</span><strong>{result.governance.inputTokens + result.governance.outputTokens}</strong></div>
+              <div><span>Reliability</span><strong>{result.governance.retries} retries · {result.governance.partialFailures.length} partial</strong></div>
               <div><span>Trace policy</span><strong>Sensitive data off</strong></div>
             </div>
           )}
@@ -407,6 +438,24 @@ export default function Home() {
                       <ul>{decisionResult.memo.assumptions.map((item) => <li key={item}>{item}</li>)}</ul>
                     </div>
                   </div>
+                  <div className="evaluation-panel">
+                    <div className="evaluation-heading">
+                      <div>
+                        <p className="eyebrow">Independent quality gate</p>
+                        <h3>Evaluator rubric</h3>
+                      </div>
+                      <span>{decisionResult.evaluation.revisionPerformed ? "1 revision completed" : "Passed without revision"}</span>
+                    </div>
+                    <div className="evaluation-scores">
+                      <p><span>Evidence</span><b>{decisionResult.evaluation.evidenceGrounding}/5</b></p>
+                      <p><span>Disagreement</span><b>{decisionResult.evaluation.disagreementPreserved}/5</b></p>
+                      <p><span>Actionability</span><b>{decisionResult.evaluation.actionability}/5</b></p>
+                      <p><span>Reversibility</span><b>{decisionResult.evaluation.reversibility}/5</b></p>
+                    </div>
+                    {decisionResult.evaluation.unsupportedClaims.length > 0 && (
+                      <p className="evaluation-warning">Unsupported claims: {decisionResult.evaluation.unsupportedClaims.join(" · ")}</p>
+                    )}
+                  </div>
                   <div className="memo-columns">
                     <div>
                       <h3>Why this call</h3>
@@ -426,6 +475,40 @@ export default function Home() {
                     <p>{decisionResult.memo.nextSteps[0]}</p>
                     <b aria-hidden="true">→</b>
                   </div>
+                  <div className="approval-panel">
+                    <div>
+                      <p className="eyebrow">Human authority boundary</p>
+                      <h3>Accept and create action plan</h3>
+                      <p>{decisionResult.approval.summary}</p>
+                    </div>
+                    {decisionResult.approval.status === "unavailable" ? (
+                      <span className="approval-unavailable">Persistence required</span>
+                    ) : approvalStatus === "idle" ? (
+                      <button type="button" onClick={() => resolveApproval("request")} disabled={isApproving}>
+                        {isApproving ? "Preparing approval…" : "Review protected action"}
+                      </button>
+                    ) : approvalStatus === "pending" ? (
+                      <div className="approval-actions">
+                        <button type="button" className="approve" onClick={() => resolveApproval("approve")} disabled={isApproving}>Approve</button>
+                        <button type="button" onClick={() => resolveApproval("reject")} disabled={isApproving}>Reject</button>
+                      </div>
+                    ) : (
+                      <span className={`approval-resolution ${approvalStatus}`}>{approvalStatus}</span>
+                    )}
+                    {approvalError && <p className="approval-error" role="alert">{approvalError}</p>}
+                  </div>
+                  {actionPlan && (
+                    <div className="action-plan">
+                      <p className="eyebrow">Persisted action plan · {actionPlan.status}</p>
+                      <h3>{actionPlan.recommendedOption}</h3>
+                      {actionPlan.tasks.map((task) => (
+                        <div key={task.title}>
+                          <b>{task.title}</b>
+                          <span>{task.ownerRole} · {task.dueInDays} days · {task.successMeasure}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </>
               )}
             </div>
