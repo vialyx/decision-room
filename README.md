@@ -1,92 +1,141 @@
 # Decision Room
 
-Decision Room is a working proof of multi-agent orchestration built with the
+Decision Room is a governed multi-agent decision system built with the
 [OpenAI Agents SDK for TypeScript](https://openai.github.io/openai-agents-js/).
 
-The repository demonstrates a concrete orchestration pattern: several
-specialized agents analyze the same decision independently and in parallel,
-then a separate chairperson agent evaluates their structured outputs and
-produces one final recommendation.
+It is an educational, inspectable example of how to combine semantic routing,
+typed tools, layered guardrails, deterministic parallel orchestration, and
+trace-based observability without handing decision authority to AI.
 
-The point of the project is not to simulate a group chat. It is to make the
-coordination mechanics visible and easy to inspect in code:
+The application accepts a decision brief, checks whether it is safe and
+sufficiently specified, routes incomplete briefs to clarification, and sends
+ready briefs to four independent specialists. A separate chairperson preserves
+material disagreement and returns a conditional recommendation.
 
-- distinct agent roles and instructions;
-- concurrent agent execution;
-- schema-validated, structured outputs;
-- deterministic application-level orchestration;
-- synthesis by a separate agent with a different mandate;
-- a runnable fallback that demonstrates the product without an API key.
-
-## Orchestration flow
+## Governed workflow
 
 ```mermaid
-flowchart LR
-    Brief[Decision brief] --> R[Researcher]
-    Brief --> D[Domain expert]
-    Brief --> S[Skeptic]
-    Brief --> A[Risk analyst]
+flowchart TD
+    Brief[Decision brief + evidence] --> InputGuardrail[Blocking input guardrail]
+    InputGuardrail --> Intake[Intake Agent]
+    Intake -->|SDK handoff: incomplete| Clarification[Clarification Agent]
+    Intake -->|SDK handoff: ready| Coordinator[Decision Council Coordinator]
+
+    Coordinator --> R[Researcher]
+    Coordinator --> D[Domain expert]
+    Coordinator --> S[Skeptic]
+    Coordinator --> A[Risk analyst]
+
+    Evidence[Typed evidence items] --> Tool[inspect_evidence tool]
+    Tool -->|tool input + output guardrails| R
 
     R --> Council[Structured analyses]
     D --> Council
     S --> Council
     A --> Council
 
-    Council --> Chair[Chairperson agent]
-    Brief --> Chair
-    Chair --> Memo[Decision memo]
+    Council --> Chair[Chairperson Agent]
+    Chair --> OutputGuardrail[Semantic output guardrail]
+    OutputGuardrail --> Memo[Conditional decision memo]
 ```
 
-The four specialist runs are started together with `Promise.all()`. Each agent
-returns the same Zod-validated analysis shape. Only after all four analyses are
-complete does the chairperson receive the original brief plus the full council
-record.
+Two orchestration patterns are deliberately used for different jobs:
 
-This design deliberately preserves disagreement. The chairperson is instructed
-to weigh evidence rather than decide by majority vote.
+- **Model-selected SDK handoffs** route a brief according to its meaning and
+  completeness. Once selected, the receiving intake specialist takes control.
+- **Deterministic application orchestration** launches every council specialist
+  with `Promise.all()`. Every perspective must run; routing by model choice
+  would make this stage less predictable.
 
-## The agent council
+## SDK capabilities demonstrated
 
-| Agent | Responsibility |
+| Capability | Portfolio evidence |
 | --- | --- |
-| Researcher | Separates evidence from assumptions and identifies missing data |
-| Domain expert | Evaluates strategic fit, feasibility, and operating tradeoffs |
-| Skeptic | Builds the strongest credible case against the apparent consensus |
-| Risk analyst | Maps downside exposure, mitigations, and stop conditions |
-| Chairperson | Synthesizes the independent analyses into a conditional recommendation |
+| Agents | Intake, clarification, coordinator, four specialists, and chairperson |
+| Tools | Researcher invokes `inspect_evidence` with a Zod input and output schema |
+| Handoffs | Intake transfers control through typed clarification and council payloads |
+| Guardrails | Blocking input safety, tool input/output checks, and semantic memo validation |
+| Structured output | Specialist, evidence, clarification, readiness, and memo contracts |
+| Tracing | One named workflow trace with custom phase spans and safe metadata |
+| Parallel orchestration | All four mandatory specialist runs fan out and fan in deterministically |
 
-## Where the agent code lives
+## Evidence tool
 
-The complete orchestration is implemented in
-[`app/api/decision/route.ts`](app/api/decision/route.ts):
+Users can attach up to six evidence items and label each source as analytics,
+customer interview, survey, estimate, or assumption. The Researcher is the only
+specialist equipped with the `inspect_evidence` function tool.
 
-- `SPECIALISTS` defines the roles and mandates.
-- `runLiveCouncil()` creates and runs the four specialist agents.
-- `Promise.all(specialistRuns)` provides parallel fan-out and fan-in.
-- the `Chairperson` agent performs the final synthesis.
-- `POST()` selects the live or demo execution path.
+The model chooses and invokes the tool; deterministic application logic assigns
+the reliability score and warning. Tool guardrails reject malformed arguments,
+prompt injection, secrets, and personal data, then validate the returned result
+before it re-enters the agent loop.
 
-Shared result contracts are defined in
-[`lib/decision-types.ts`](lib/decision-types.ts). The product interface is in
-[`app/page.tsx`](app/page.tsx).
+This boundary demonstrates that models can decide *when* to use a capability
+while application code retains control of *what the capability does*.
 
-## Live mode and demo mode
+## Guardrail boundaries
 
-When `OPENAI_API_KEY` is available, requests execute the real Agents SDK
-workflow. Without a key, the API uses a deterministic demo council so the
-interface and result contract remain explorable.
+Decision Room applies controls at three distinct boundaries:
 
-Demo mode is a product fallback, not a second orchestration implementation.
-The proof-of-orchestration code is `runLiveCouncil()`.
+1. **Input** — a blocking SDK guardrail runs with `runInParallel: false`, so an
+   unsafe brief cannot start model or tool work. Prompt injection, credentials,
+   and common personal-data patterns are rejected. Employment, medical, legal,
+   and financial decisions require explicit qualified human review.
+2. **Tool** — every evidence-tool call validates arguments before execution and
+   validates the deterministic result afterward.
+3. **Output** — the chairperson memo must name exactly one submitted option,
+   preserve disagreement, separate facts from assumptions, and include at least
+   two measurable stop or reversal conditions.
+
+Zod answers “is this structure valid?” Guardrails answer “is this workflow
+responsible enough to continue?”
+
+## Tracing and sensitive-data policy
+
+Live runs are grouped under one `Decision Room governed workflow` trace. Custom
+spans identify intake routing, specialist fan-out, each specialist, and chair
+synthesis plus semantic validation.
+
+Trace metadata contains only operational fields:
+
+- generated decision ID;
+- risk posture;
+- option and evidence counts;
+- execution mode;
+- workflow version.
+
+The full decision text is never copied into trace metadata, and
+`traceIncludeSensitiveData` is set to `false`. The interface exposes the
+decision ID, handoff destination, tool-call count, passed guardrails, and trace
+privacy policy as a lightweight run inspector.
+
+## Where the implementation lives
+
+- [`app/api/decision/route.ts`](app/api/decision/route.ts) defines the agents,
+  typed handoffs, deterministic parallel council, named trace, and API flow.
+- [`lib/decision-governance.ts`](lib/decision-governance.ts) contains schemas,
+  evidence logic, safety classification, and all three guardrail layers.
+- [`lib/decision-types.ts`](lib/decision-types.ts) defines browser/server result
+  contracts.
+- [`app/page.tsx`](app/page.tsx) makes evidence, intake routing, and governance
+  outcomes visible in the product.
+
+## Live and demo modes
+
+When `OPENAI_API_KEY` is available, the request executes the real Agents SDK
+workflow. Without a key, the API uses a deterministic demo path that preserves
+the same response contract and visibly labels the result as a demo.
+
+Demo mode allows the interface and governance outcomes to be explored without
+spending tokens. The actual SDK handoff, tool, guardrail, and trace proof is in
+the live workflow code.
 
 ## Run locally
 
-### Prerequisites
+Prerequisites:
 
 - Node.js 22.13 or newer
-- An OpenAI API key for live agent execution
-
-Install dependencies:
+- An OpenAI API key for live execution
 
 ```bash
 pnpm install
@@ -98,6 +147,7 @@ Create `.env.local`:
 OPENAI_API_KEY=your_api_key
 
 # Optional model overrides
+OPENAI_INTAKE_MODEL=gpt-5.6-terra
 OPENAI_SPECIALIST_MODEL=gpt-5.6-terra
 OPENAI_CHAIR_MODEL=gpt-5.6-sol
 ```
@@ -117,35 +167,27 @@ pnpm build
 pnpm test
 ```
 
-The tests verify that the Decision Room renders, the Agents SDK orchestration
-is present, and the keyless demo request completes end to end.
+The tests verify rendering, SDK primitives, the keyless governed council,
+prompt-injection blocking, and clarification routing.
 
-## What this proof demonstrates
+## Governance tradeoffs
 
-This repository is intentionally small, but it establishes the foundations for
-larger agent systems:
+- The intake model may route semantically, but it cannot skip a mandatory
+  specialist once the council begins.
+- Tool scores are deterministic and inspectable rather than generated by the
+  model.
+- The chairperson advises; it does not approve, send, save, or execute the
+  recommendation.
+- Traces favor privacy over full replay by excluding sensitive payload data.
+- Guardrails are intentionally small demonstrations, not a substitute for a
+  complete organization-specific safety policy.
 
-1. **Specialization** — each agent has a narrow perspective instead of sharing
-   one general-purpose prompt.
-2. **Parallelism** — independent analysis runs concurrently to reduce overall
-   workflow latency.
-3. **Typed boundaries** — agents communicate through validated structures
-   rather than loosely formatted prose.
-4. **Separation of analysis and judgment** — specialists investigate; the chair
-   makes the final call.
-5. **Inspectability** — the entire orchestration fits in one server route and
-   can be followed from input to output.
+## Next production-control milestone
 
-Natural next experiments include tool-enabled research, an evaluator/revision
-loop, persisted decision sessions, human approval gates, and orchestration
-evals.
-
-## Stack
-
-- [OpenAI Agents SDK](https://openai.github.io/openai-agents-js/)
-- TypeScript and Zod
-- React and vinext
-- Cloudflare Workers-compatible deployment
+The next bounded increment is a human-approved “accept and create action plan”
+tool with persisted interrupted run state, followed by one rubric-based
+evaluation and at most one chair revision. Those controls are intentionally not
+simulated in the current release.
 
 ## Deployed demo
 

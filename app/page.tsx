@@ -2,8 +2,9 @@
 
 import { FormEvent, useMemo, useState } from "react";
 import type {
+  DecisionApiResult,
   DecisionInput,
-  DecisionResult,
+  EvidenceSourceType,
   SpecialistAnalysis,
 } from "@/lib/decision-types";
 
@@ -15,6 +16,18 @@ const SAMPLE: DecisionInput = {
   objectives:
     "Increase expansion revenue without damaging reliability or distracting from the core product.",
   riskTolerance: "balanced",
+  evidenceItems: [
+    { claim: "18% of weekly active users collaborate with a team", sourceType: "analytics" },
+    { claim: "Shared workspaces are a repeated customer request", sourceType: "customer_interview" },
+  ],
+};
+
+const EVIDENCE_LABELS: Record<EvidenceSourceType, string> = {
+  analytics: "Analytics",
+  customer_interview: "Customer interview",
+  survey: "Survey",
+  estimate: "Estimate",
+  assumption: "Assumption",
 };
 
 const AGENT_SHELLS = [
@@ -54,6 +67,11 @@ function SpecialistCard({ analysis, index }: { analysis: SpecialistAnalysis; ind
         <span>Recommends</span>
         <p>{analysis.recommendation}</p>
       </div>
+      {analysis.evidenceAssessments.length > 0 && (
+        <div className="evidence-assessment-count">
+          Tool-classified evidence · {analysis.evidenceAssessments.length}
+        </div>
+      )}
     </article>
   );
 }
@@ -61,7 +79,9 @@ function SpecialistCard({ analysis, index }: { analysis: SpecialistAnalysis; ind
 export default function Home() {
   const [brief, setBrief] = useState<DecisionInput>(SAMPLE);
   const [optionDraft, setOptionDraft] = useState("");
-  const [result, setResult] = useState<DecisionResult | null>(null);
+  const [evidenceDraft, setEvidenceDraft] = useState("");
+  const [evidenceSource, setEvidenceSource] = useState<EvidenceSourceType>("analytics");
+  const [result, setResult] = useState<DecisionApiResult | null>(null);
   const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState("");
 
@@ -81,6 +101,13 @@ export default function Home() {
     setOptionDraft("");
   }
 
+  function addEvidence() {
+    const claim = evidenceDraft.trim();
+    if (!claim || brief.evidenceItems.length >= 6) return;
+    update("evidenceItems", [...brief.evidenceItems, { claim, sourceType: evidenceSource }]);
+    setEvidenceDraft("");
+  }
+
   async function convene(event: FormEvent) {
     event.preventDefault();
     if (!canRun) return;
@@ -95,17 +122,20 @@ export default function Home() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify(brief),
       });
-      const payload = (await response.json()) as DecisionResult | { error?: string };
+      const payload = (await response.json()) as DecisionApiResult | { error?: string };
       if (!response.ok) {
         throw new Error("error" in payload && payload.error ? payload.error : "The room could not reach a decision.");
       }
-      setResult(payload as DecisionResult);
+      setResult(payload as DecisionApiResult);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Something interrupted the session.");
     } finally {
       setIsRunning(false);
     }
   }
+
+  const decisionResult = result?.route === "decision_council" ? result : null;
+  const clarification = result?.route === "clarification" ? result : null;
 
   return (
     <main className="app-shell">
@@ -167,6 +197,51 @@ export default function Home() {
                 placeholder="Share the facts, constraints, and signals the room should know."
               />
             </label>
+
+            <div className="field evidence-field">
+              <span>Evidence items <i>optional</i></span>
+              <div className="evidence-list">
+                {brief.evidenceItems.map((item, index) => (
+                  <div className="evidence-chip" key={`${item.claim}-${index}`}>
+                    <div>
+                      <b>{EVIDENCE_LABELS[item.sourceType]}</b>
+                      <p>{item.claim}</p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => update("evidenceItems", brief.evidenceItems.filter((_, itemIndex) => itemIndex !== index))}
+                      aria-label={`Remove evidence: ${item.claim}`}
+                    >×</button>
+                  </div>
+                ))}
+              </div>
+              <div className="evidence-entry">
+                <select
+                  value={evidenceSource}
+                  onChange={(event) => setEvidenceSource(event.target.value as EvidenceSourceType)}
+                  aria-label="Evidence source type"
+                >
+                  {Object.entries(EVIDENCE_LABELS).map(([value, label]) => (
+                    <option value={value} key={value}>{label}</option>
+                  ))}
+                </select>
+                <input
+                  value={evidenceDraft}
+                  onChange={(event) => setEvidenceDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      addEvidence();
+                    }
+                  }}
+                  maxLength={400}
+                  placeholder="Add one claim or signal"
+                  aria-label="Evidence claim"
+                />
+                <button type="button" onClick={addEvidence} aria-label="Add evidence item">+</button>
+              </div>
+              <small>Each item is classified by a guarded Researcher tool.</small>
+            </div>
 
             <div className="field">
               <span>Options on the table</span>
@@ -234,7 +309,7 @@ export default function Home() {
               <span>{isRunning ? "Council in session" : "Convene the room"}</span>
               <b aria-hidden="true">{isRunning ? "···" : "→"}</b>
             </button>
-            <p className="form-note">Independent analysis runs in parallel. No external actions are taken.</p>
+            <p className="form-note">Intake routes first. Guarded analysis runs only when the brief is ready. No external actions are taken.</p>
           </form>
         </aside>
 
@@ -242,16 +317,36 @@ export default function Home() {
           <div className="council-heading">
             <div>
               <p className="eyebrow">The council</p>
-              <h2>{isRunning ? "Arguments are forming" : result ? "Four independent readings" : "Ready to deliberate"}</h2>
+              <h2>{isRunning ? "Intake is routing the brief" : clarification ? "Clarification required" : decisionResult ? "Four independent readings" : "Ready to deliberate"}</h2>
             </div>
             <div className={`session-state ${isRunning ? "is-running" : ""}`}>
-              <span />{isRunning ? "Analyzing" : result ? "Complete" : "Standing by"}
+              <span />{isRunning ? "Routing" : clarification ? "Needs input" : decisionResult ? "Complete" : "Standing by"}
             </div>
           </div>
 
           {error && <div className="error-banner" role="alert">{error}</div>}
 
-          {!result ? (
+          {result && (
+            <div className="governance-strip" aria-label="Governed workflow summary">
+              <div><span>Decision</span><strong>{result.governance.decisionId}</strong></div>
+              <div><span>SDK handoff</span><strong>{result.governance.handoffDestination}</strong></div>
+              <div><span>Evidence tools</span><strong>{result.governance.evidenceToolCalls}</strong></div>
+              <div><span>Guardrails</span><strong>{result.governance.guardrailsPassed}/{result.governance.guardrailsTotal} passed</strong></div>
+              <div><span>Trace policy</span><strong>Sensitive data off</strong></div>
+            </div>
+          )}
+
+          {clarification && (
+            <article className="clarification-card">
+              <p className="eyebrow">Intake → Clarification Agent · {clarification.priority}</p>
+              <h3>The council paused before analysis.</h3>
+              <p>{clarification.reason}</p>
+              <ul>{clarification.missingInformation.map((item) => <li key={item}>{item}</li>)}</ul>
+              <small>No specialist or chair tokens were spent after this route.</small>
+            </article>
+          )}
+
+          {!decisionResult ? (
             <div className={`agent-grid empty ${isRunning ? "loading" : ""}`}>
               {AGENT_SHELLS.map((agent, index) => (
                 <article className={`agent-placeholder tone-${agent.tone}`} key={agent.role}>
@@ -270,20 +365,20 @@ export default function Home() {
             </div>
           ) : (
             <div className="agent-grid">
-              {result.specialists.map((analysis, index) => (
+              {decisionResult.specialists.map((analysis, index) => (
                 <SpecialistCard analysis={analysis} index={index} key={analysis.role} />
               ))}
             </div>
           )}
 
-          <article className={`memo ${result ? "has-result" : ""}`}>
+          <article className={`memo ${decisionResult ? "has-result" : ""}`}>
             <div className="memo-rail">
               <span className="chair-mark">CH</span>
               <span className="rail-line" />
               <span className="vertical-label">CHAIRPERSON’S MEMO</span>
             </div>
             <div className="memo-body">
-              {!result ? (
+              {!decisionResult ? (
                 <div className="memo-empty">
                   <p className="eyebrow">Final synthesis</p>
                   <h2>The chair is waiting for the council.</h2>
@@ -293,32 +388,42 @@ export default function Home() {
                 <>
                   <div className="memo-header">
                     <div>
-                      <p className="eyebrow">Final synthesis · {result.mode === "live" ? "Live council" : "Demo council"}</p>
-                      <h2>{result.memo.verdict}</h2>
+                      <p className="eyebrow">Final synthesis · {decisionResult.mode === "live" ? "Live council" : "Demo council"}</p>
+                      <h2>{decisionResult.memo.verdict}</h2>
                     </div>
                     <div className="memo-confidence">
-                      <strong>{result.memo.confidence}%</strong>
+                      <strong>{decisionResult.memo.confidence}%</strong>
                       <span>confidence</span>
                     </div>
                   </div>
-                  <p className="memo-summary">{result.memo.summary}</p>
+                  <p className="memo-summary">{decisionResult.memo.summary}</p>
+                  <div className="evidence-ledger">
+                    <div>
+                      <h3>Facts used</h3>
+                      <ul>{decisionResult.memo.facts.map((item) => <li key={item}>{item}</li>)}</ul>
+                    </div>
+                    <div>
+                      <h3>Assumptions kept visible</h3>
+                      <ul>{decisionResult.memo.assumptions.map((item) => <li key={item}>{item}</li>)}</ul>
+                    </div>
+                  </div>
                   <div className="memo-columns">
                     <div>
                       <h3>Why this call</h3>
-                      <ul>{result.memo.rationale.map((item) => <li key={item}>{item}</li>)}</ul>
+                      <ul>{decisionResult.memo.rationale.map((item) => <li key={item}>{item}</li>)}</ul>
                     </div>
                     <div className="disagreement-box">
                       <h3>Where the room disagreed</h3>
-                      <ul>{result.memo.disagreements.map((item) => <li key={item}>{item}</li>)}</ul>
+                      <ul>{decisionResult.memo.disagreements.map((item) => <li key={item}>{item}</li>)}</ul>
                     </div>
                   </div>
                   <div className="conditions">
                     <h3>Conditions that would change the call</h3>
-                    <div>{result.memo.conditions.map((item, index) => <p key={item}><b>0{index + 1}</b>{item}</p>)}</div>
+                    <div>{decisionResult.memo.conditions.map((item, index) => <p key={item}><b>0{index + 1}</b>{item}</p>)}</div>
                   </div>
                   <div className="next-step">
                     <span>Next move</span>
-                    <p>{result.memo.nextSteps[0]}</p>
+                    <p>{decisionResult.memo.nextSteps[0]}</p>
                     <b aria-hidden="true">→</b>
                   </div>
                 </>
